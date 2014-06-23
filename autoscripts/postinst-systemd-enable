@@ -1,0 +1,3 @@
+if [ -x "/usr/bin/deb-systemd-helper" ]; then
+	deb-systemd-helper enable #UNITFILES# >/dev/null || true
+fi

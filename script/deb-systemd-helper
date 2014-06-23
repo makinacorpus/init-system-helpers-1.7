@@ -1,0 +1,344 @@
+#!/usr/bin/env perl
+# vim:ts=4:sw=4:expandtab
+# © 2013 Michael Stapelberg <stapelberg@debian.org>
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#
+#     * Neither the name of Michael Stapelberg nor the
+#       names of contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+# .
+# THIS SOFTWARE IS PROVIDED BY Michael Stapelberg ''AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL Michael Stapelberg BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=head1 NAME
+
+deb-systemd-helper - subset of systemctl for machines not running systemd
+
+=head1 SYNOPSIS
+
+B<deb-systemd-helper> enable|disable|is-enabled|reenable S<I<unit file> ...>
+
+=head1 DESCRIPTION
+
+B<deb-systemd-helper> is a Debian-specific helper script which re-implements
+the enable, disable, is-enabled and reenable commands from systemctl. Unlike
+systemctl, B<deb-systemd-helper> does not require systemd to be running.
+
+The "enable" action will only be performed once (when first installing the
+package). On the first "enable", an state file is created which will be deleted
+upon "disable", but only when _DEB_SYSTEMD_HELPER_PURGE=1 to distinguish purge
+from remove.
+
+B<deb-systemd-helper> is intended to be used from maintscripts to enable
+systemd unit files. It is specifically NOT intended to be used interactively by
+users. Instead, users should run systemd and use systemctl, or not bother about
+the systemd enabled state in case they are not running systemd.
+
+=head1 ENVIRONMENT
+
+=over 4
+
+=item B<_DEB_SYSTEMD_HELPER_DEBUG>
+
+If you export _DEB_SYSTEMD_HELPER_DEBUG=1, deb-systemd-helper will print debug
+messages to stderr (thus visible in dpkg runs). Please include these when
+filing a bugreport.
+
+=back
+
+=cut
+
+use strict;
+use warnings;
+use File::Path qw(make_path); # in core since Perl 5.001
+use File::Basename; # in core since Perl 5
+use File::Find; # in core since Perl 5
+use Text::ParseWords qw(shellwords); # in core since Perl 5
+use Getopt::Long; # in core since Perl 5
+use Data::Dumper;
+
+my $quiet = 0;
+my $state_dir = '/var/lib/systemd/deb-systemd-helper-enabled';
+
+# Globals are bad, but in this specific case, it really makes things much
+# easier to write and understand.
+my $changed_sth;
+
+sub error {
+    print STDERR "$0: error: @_\n";
+    exit (1);
+}
+
+sub debug {
+    my ($msg) = @_;
+    return if !defined($ENV{_DEB_SYSTEMD_HELPER_DEBUG}) || $ENV{_DEB_SYSTEMD_HELPER_DEBUG} != 1;
+    print STDERR "(deb-systemd-helper DEBUG) $msg\n";
+}
+
+sub is_purge {
+    return (defined($ENV{_DEB_SYSTEMD_HELPER_PURGE}) && $ENV{_DEB_SYSTEMD_HELPER_PURGE} == 1)
+}
+
+sub find_unit {
+    my ($scriptname) = @_;
+
+    my $service_path = $scriptname;
+    if (-f "/etc/systemd/system/$scriptname") {
+        $service_path = "/etc/systemd/system/$scriptname";
+    } elsif (-f "/lib/systemd/system/$scriptname") {
+        $service_path = "/lib/systemd/system/$scriptname";
+    }
+    return $service_path;
+}
+
+# Writes $service_link into $statefile unless it’s already in there.
+sub record_in_statefile {
+    my ($statefile, $service_link) = @_;
+
+    make_path(dirname($statefile));
+    open(my $fh, '>>', $statefile) or error("unable to write to $statefile");
+    while (<$fh>) {
+        chomp;
+        if ($_ eq $service_link) {
+            close($fh);
+            return;
+        }
+    }
+    print $fh "$service_link\n";
+    close($fh);
+}
+
+sub make_link {
+    my ($service_path, $service_link, $action, $orig_statename) = @_;
+    my $already_enabled = 1;
+
+    if ($action eq 'is-enabled') {
+        $already_enabled = 0 if ! -l $service_link;
+    } else {
+        record_in_statefile("$state_dir/$orig_statename", $service_link);
+
+        my $statefile = $service_link;
+        $statefile =~ s,^/etc/systemd/system/,$state_dir/,;
+        if (-e $statefile) {
+            return $already_enabled;
+        }
+
+        if (! -l $service_link) {
+            make_path(dirname($service_link));
+            print STDERR "ln -s '$service_path' '$service_link'\n" unless $quiet;
+            symlink($service_path, $service_link) or
+                error("unable to link $service_link to $service_path: $!");
+            $changed_sth = 1;
+        }
+
+        # Store the fact that we ran enable for this service_path,
+        # so that we can skip enable the next time.
+        # This allows us to call deb-systemd-helper unconditionally
+        # and still only enable unit files on the initial installation
+        # of a package.
+        make_path(dirname($statefile));
+        open(my $fh, '>>', $statefile);
+        close($fh);
+    }
+
+    return $already_enabled;
+}
+
+sub make_systemd_links {
+    my ($scriptname, $service_path, $action, $statename) = @_;
+
+    $statename //= basename($scriptname) . '.dsh-also';
+
+    my $already_enabled = 1;
+    open my $fh, '<', $service_path or error("unable to read $service_path");
+    while (my $line = <$fh>) {
+        chomp($line);
+        my $service_link;
+
+        if ($line =~ /^\s*(WantedBy|RequiredBy)=(.+)$/i) {
+            for my $value (shellwords($2)) {
+                my $wants_dir = "/etc/systemd/system/$value";
+                $wants_dir .= '.wants' if $1 eq 'WantedBy';
+                $wants_dir .= '.requires' if $1 eq 'RequiredBy';
+                $already_enabled = 0 if
+                    !make_link($service_path, "$wants_dir/$scriptname", $action, $statename);
+            }
+        }
+
+        if ($line =~ /^\s*Also=(.+)$/i) {
+            for my $value (shellwords($1)) {
+                $already_enabled = 0 if
+                    !make_systemd_links($value, find_unit($value), $action, $statename);
+            }
+        }
+
+        if ($line =~ /^\s*Alias=(.+)$/i) {
+            for my $value (shellwords($1)) {
+                $already_enabled = 0 if
+                    !make_link($service_path, "/etc/systemd/system/$1", $action, $statename);
+            }
+        }
+
+    }
+    close($fh);
+
+    return $already_enabled;
+}
+
+sub remove_links {
+    my ($service_path) = @_;
+
+    my $statefile = "$state_dir/" . basename($service_path) . '.dsh-also';
+    debug "Reading state file $statefile";
+    my $fh;
+    my @other;
+    if (open($fh, '<', $statefile)) {
+        @other = map { chomp; $_ } <$fh>;
+        close($fh);
+    }
+
+    debug "Contents: " . Dumper(\@other);
+
+    if (is_purge()) {
+        unlink($statefile) if -e $statefile;
+    }
+
+    # Also disable all the units which were enabled when this one was enabled.
+    for my $link (@other) {
+        # Delete the corresponding state file:
+        # • Always when purging
+        # • If the user did not disable (= link still exists) the service.
+        #   If we don’t do this, the link will be deleted a few lines down,
+        #   but not re-created when re-installing the package.
+        if (is_purge() || -l $link) {
+            my $link_state = $link;
+            $link_state =~ s,^/etc/systemd/system/,$state_dir/,;
+            unlink($link_state);
+        }
+
+        next unless -l $link;
+        print STDERR "rm '$link'\n" unless $quiet;
+        unlink($link);
+
+        $changed_sth = 1;
+    }
+
+    # Read $service_path, recurse for all Also= units.
+    # This might not work when $service_path was already deleted,
+    # i.e. after apt-get remove. In this case we just return
+    # silently in order to not confuse the user about whether
+    # disabling actually worked or not — the case is handled by
+    # dh_installsystemd generating an appropriate disable
+    # command by parsing the service file at debhelper-time.
+    open $fh, '<', $service_path or return;
+    while (my $line = <$fh>) {
+        chomp($line);
+        my $service_link;
+
+        if ($line =~ /^\s*Also=(.+)$/i) {
+            remove_links(find_unit($1));
+        }
+    }
+    close($fh);
+}
+
+# Recursively deletes a directory structure, if all (!) components are empty,
+# e.g. to clean up after purging.
+sub rmdir_if_empty {
+    my ($dir) = @_;
+
+    debug "rmdir_if_empty $dir";
+
+    rmdir_if_empty($_) for (grep { -d } <$dir/*>);
+
+    if (!rmdir($dir)) {
+        debug "rmdir($dir) failed ($!)";
+    }
+}
+
+my $result = GetOptions(
+    "quiet" => \$quiet,
+);
+
+my $action = shift;
+if (!defined($action)) {
+    # Called without arguments. Explain that this script should not be run interactively.
+    print "$0 is a program which should be called by dpkg maintscripts only.\n";
+    print "Please do not run it interactively, ever. Also see the manpage deb-systemd-helper(1).\n";
+    exit 0;
+}
+
+if (!$ENV{DPKG_MAINTSCRIPT_PACKAGE}) {
+    print STDERR "$0 was not called from dpkg. Exiting.\n";
+    exit 1;
+}
+
+debug "is purge = " . (is_purge() ? "yes" : "no");
+
+my $rc = $action eq 'is-enabled' ? 1 : 0;
+for my $scriptname (@ARGV) {
+    my $service_path = find_unit($scriptname);
+
+    debug "action = $action, scriptname = $scriptname, service_path = $service_path";
+
+    if ($action eq 'is-enabled') {
+        my $enabled = make_systemd_links($scriptname, $service_path, $action);
+        print STDERR ($enabled ? "enabled\n" : "disabled\n");
+        $rc = 0 if $enabled;
+    }
+
+    if ($action eq 'reenable') {
+        remove_links($service_path);
+        make_systemd_links($scriptname, $service_path, $action, undef);
+    }
+
+    if ($action eq 'disable') {
+        remove_links($service_path);
+        # Clean up the state dir if it’s empty, or at least clean up all empty
+        # subdirectories. Necessary to cleanly pass a piuparts run.
+        rmdir_if_empty('/var/lib/systemd/deb-systemd-helper-enabled');
+
+        # Same with /etc/systemd, where we create symlinks. If systemd is not
+        # installed (and no other package shipping service files), this would
+        # make piuparts fail, too.
+        rmdir_if_empty('/etc/systemd');
+    }
+
+    if ($action eq 'enable') {
+        make_systemd_links($scriptname, $service_path, $action, undef);
+    }
+}
+
+# If we changed anything and this machine is running systemd, tell
+# systemd to reload so that it will immediately pick up our
+# changes.
+if ($changed_sth && -d "/run/systemd/system") {
+    system("systemctl", "daemon-reload");
+}
+
+exit $rc;
+
+=head1 AUTHOR
+
+Michael Stapelberg <stapelberg@debian.org>
+
+=cut

@@ -1,0 +1,7 @@
+if [ -x "/usr/bin/deb-systemd-helper" ]; then
+	# This might seem weird at first glance, but the seemingly useless
+	# enable/disable is necessary to make deb-systemd-helper create its
+	# state file to properly disable the unit files at purge time.
+	deb-systemd-helper --quiet enable #UNITFILES# >/dev/null || true
+	deb-systemd-helper --quiet disable #UNITFILES# >/dev/null || true
+fi

@@ -1,0 +1,11 @@
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+	if [ -x "/usr/bin/deb-systemd-helper" ]; then
+		if [ "$1" = "purge" ]; then
+			export _DEB_SYSTEMD_HELPER_PURGE=1
+		else
+			# To explicitly clean the environment.
+			export _DEB_SYSTEMD_HELPER_PURGE=0
+		fi
+		deb-systemd-helper disable #UNITFILES# >/dev/null
+	fi
+fi
